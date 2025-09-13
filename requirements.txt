@@ -1,0 +1,16 @@
+# Marine FITREP PDF Data Extractor - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# PDF processing and text extraction
+PyMuPDF==1.23.26
+
+# OCR capabilities (for grade field extraction)
+pytesseract==0.3.10
+
+# Image processing support
+Pillow==10.0.1
+
+# Note: Tesseract OCR engine must be installed separately
+# macOS: brew install tesseract
+# Ubuntu/Debian: sudo apt-get install tesseract-ocr
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
