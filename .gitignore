@@ -49,3 +49,4 @@ Thumbs.db
 output/
 temp/
 Cleanup/
+*.dmg
