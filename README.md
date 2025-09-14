@@ -65,7 +65,6 @@ The script will prompt you to choose:
 ## 📁 Project Structure
 
 - `fitrep_extractor.py` — main extractor and only required entry point.
-- `Cleanup/` — historical/experimental scripts and debug tools; not required for normal use and git-ignored by default.
 
 Note: An older experimental file `fitrep_extractor_improved.py` has been removed. Use `fitrep_extractor.py` for all extraction tasks.
 
