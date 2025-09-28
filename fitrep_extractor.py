@@ -42,6 +42,12 @@ class FITREPExtractor:
                 .replace("5", "S")
                 .replace(":", "")
                 .replace(".", ""))
+
+    def normalize_grade_token(self, s):
+        """Normalize a token specifically for grade matching (preserve digits)."""
+        s = s.strip().upper()
+        # Keep only alphanumeric (drop punctuation/spaces), but DO NOT map digits
+        return ''.join(ch for ch in s if ch.isalnum())
     
     def find_label_indices(self, ocr_data, labels):
         """Find indices of labels in OCR data"""
@@ -126,59 +132,154 @@ class FITREPExtractor:
                     if name_data:
                         data.update(name_data)
                 
-                # Extract Grade - simplified approach looking for any valid grade in top third
+                # Extract Grade - fixed-region OCR (simple + accurate) with text fallback
                 grade_value = None
-                top_third_height = img.height // 3
-                
-                # First find Grade label positions
-                grade_positions = []
-                for i, text in enumerate(ocr_data["text"]):
-                    if text and "Grade" in text and ocr_data["top"][i] < top_third_height:
-                        grade_positions.append(i)
-                
-                # Method 1: Look for valid grades anywhere in top third
-                # Sometimes the grade isn't directly tied to the label due to OCR issues
-                all_top_third_tokens = []
-                for i, text in enumerate(ocr_data["text"]):
-                    if text and ocr_data["top"][i] < top_third_height:
-                        tok = self.normalize_token(text)
-                        all_top_third_tokens.append(tok)
-                        # Direct match
-                        if tok in self.valid_grades:
-                            if not grade_value:  # Take first valid grade found
+
+                # Attempt 0: Small fixed region OCR where the Marine's grade always appears
+                # Try a sequence of calibrated normalized windows (x0,y0,x1,y1)
+                # First, the window calibrated from a marked sample; then a broader default.
+                try:
+                    w, h = img.width, img.height
+                    # List of windows: (left, top, right, bottom) in normalized [0,1]
+                    grade_windows = [
+                        # Calibrated from user-marked file (fitrepPdf (3) marked.pdf)
+                        (0.60, 0.17, 0.685, 0.205),
+                        # Original default
+                        (0.58, 0.16, 0.69, 0.22),
+                        # Slightly wider fallback
+                        (0.56, 0.15, 0.71, 0.24),
+                    ]
+                    for (lx, ty, rx, by) in grade_windows:
+                        left = int(lx * w)
+                        top = int(ty * h)
+                        right = int(rx * w)
+                        bottom = int(by * h)
+                        crop = img.crop((left, top, right, bottom))
+                        ocr_fixed = pytesseract.image_to_data(
+                            crop, output_type=pytesseract.Output.DICT,
+                            config='--psm 7 --oem 1 -l eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/'
+                        )
+                        for t in ocr_fixed.get('text', []):
+                            if not t:
+                                continue
+                            tok = self.normalize_grade_token(t)
+                            if tok in self.valid_grades:
                                 grade_value = tok
-                
-                # Method 2: If no direct match, look for partial matches that might be grades
+                                break
+                        if grade_value:
+                            break
+                except Exception:
+                    pass
+
+                # Attempt 1: direct PDF text spans near a GRADE label or in top section
                 if not grade_value:
-                    # Check for grades that might be misread - based on actual OCR errors observed
-                    grade_mapping = {
-                        'MAJ': ['MAJ', 'MAS', 'MA', 'MJ', 'MAJOR', 'MAI', 'MAT'],
-                        'LTCOL': ['LTCOL', 'LRCOL', 'LTCO', 'LTC', 'LTCL', 'LICOL', 'IRCOL'],
-                        'MGYSGT': ['MGYSGT', 'MGYST', 'MGSG', 'MGYSG', 'MGYSGI'],
-                        'MSGT': ['MSGT', 'SCR', 'MSG', 'MSGI', 'MST'],  # SCR is for MSGT not MGYSGT
-                        'GYSGT': ['GYSGT', 'GYSG', 'GYST', 'GSGT'],
-                        'SSGT': ['SSGT', 'SSG', 'SSGI', 'SST'],
-                        '1STSGT': ['1STSGT', 'ISTSGT', '1STSG', 'ISTSG'],
-                        'SGTMAJ': ['SGTMAJ', 'SGTMA', 'SGMAJ', 'SGTMAS'],
-                    }
-                    
-                    for correct_grade, variations in grade_mapping.items():
-                        if correct_grade in self.valid_grades:
+                    try:
+                        page0 = doc[0]
+                        text_dict = page0.get_text("dict")
+                        top_third_limit = page0.rect.height / 3.0
+
+                        def token_iter():
+                            for block in text_dict.get("blocks", []):
+                                for line in block.get("lines", []):
+                                    y_top = line.get("bbox", [0, 0, 0, 0])[1]
+                                    for span in line.get("spans", []):
+                                        txt = (span.get("text", "") or "").strip()
+                                        if not txt:
+                                            continue
+                                        yield txt, y_top, span.get("bbox", [0, 0, 0, 0])
+
+                        # Find any grade tokens in top third
+                        for txt, y_top, bbox in token_iter():
+                            if y_top <= top_third_limit:
+                                # Split span text into alnum tokens to catch cases like "1234567890 1STLT"
+                                for piece in re.findall(r"[A-Za-z0-9]+", txt):
+                                    tok = self.normalize_grade_token(piece)
+                                    if tok in self.valid_grades:
+                                        grade_value = tok
+                                        break
+                                if grade_value:
+                                    break
+
+                        # If not found, look for a GRADE label and then take the first valid token to its right on same line
+                        if not grade_value:
+                            for block in text_dict.get("blocks", []):
+                                for line in block.get("lines", []):
+                                    spans = line.get("spans", [])
+                                    # Identify index of label-like span
+                                    label_idx = None
+                                    for i, sp in enumerate(spans):
+                                        label_text = self.normalize_token(sp.get("text", ""))
+                                        if label_text in {"GRADE", "RANK", "GRADERANK", "GRADE/ RANK", "GRADE/RANK"}:
+                                            label_idx = i
+                                            break
+                                    if label_idx is not None:
+                                        # Search subsequent spans on same line, prefer ones to the right
+                                        label_right = spans[label_idx].get("bbox", [0, 0, 0, 0])[2]
+                                        for j in range(label_idx + 1, len(spans)):
+                                            sp = spans[j]
+                                            if sp.get("bbox", [0, 0, 0, 0])[0] < label_right:
+                                                continue
+                                            # Split span into tokens and check each
+                                            for piece in re.findall(r"[A-Za-z0-9]+", sp.get("text", "")):
+                                                tok = self.normalize_grade_token(piece)
+                                                if tok in self.valid_grades:
+                                                    grade_value = tok
+                                                    break
+                                            if grade_value:
+                                                break
+                                        if grade_value:
+                                            break
+                                if grade_value:
+                                    break
+                    except Exception:
+                        # Ignore and fall back to OCR
+                        pass
+
+                # Attempt 2: OCR-based heuristics (fallback)
+                if not grade_value:
+                    top_third_height = img.height // 3
+
+                    # First find Grade label positions
+                    grade_positions = []
+                    for i, text in enumerate(ocr_data["text"]):
+                        if text and "Grade" in text and ocr_data["top"][i] < top_third_height:
+                            grade_positions.append(i)
+
+                    # Look for valid grades anywhere in top third
+                    all_top_third_tokens = []
+                    for i, text in enumerate(ocr_data["text"]):
+                        if text and ocr_data["top"][i] < top_third_height:
+                            tok = self.normalize_grade_token(text)
+                            all_top_third_tokens.append(tok)
+                            if tok in self.valid_grades and not grade_value:
+                                grade_value = tok
+
+                    # Partial/variation mapping
+                    if not grade_value:
+                        grade_mapping = {
+                            'MAJ': ['MAJ', 'MAS', 'MA', 'MJ', 'MAJOR', 'MAI', 'MAT'],
+                            'LTCOL': ['LTCOL', 'LRCOL', 'LTCO', 'LTC', 'LTCL', 'LICOL', 'IRCOL'],
+                            'MGYSGT': ['MGYSGT', 'MGYST', 'MGSG', 'MGYSG', 'MGYSGI'],
+                            'MSGT': ['MSGT', 'SCR', 'MSG', 'MSGI', 'MST'],
+                            'GYSGT': ['GYSGT', 'GYSG', 'GYST', 'GSGT'],
+                            'SSGT': ['SSGT', 'SSG', 'SSGI', 'SST'],
+                            '1STSGT': ['1STSGT', 'ISTSGT', '1STSG', 'ISTSG'],
+                            'SGTMAJ': ['SGTMAJ', 'SGTMA', 'SGMAJ', 'SGTMAS'],
+                        }
+                        for correct_grade, variations in grade_mapping.items():
                             for variation in variations:
                                 if variation in all_top_third_tokens:
                                     grade_value = correct_grade
                                     break
                             if grade_value:
                                 break
-                
-                # Method 3: Look specifically near the first Grade label if found
-                if not grade_value and grade_positions:
-                    idx = grade_positions[0]
-                    # Check next 30 tokens
-                    for k in range(idx + 1, min(idx + 30, len(ocr_data["text"]))):
-                        tok = self.normalize_token(ocr_data["text"][k])
-                        if tok:
-                            if tok in self.valid_grades:
+
+                    # Look near the first Grade label
+                    if not grade_value and grade_positions:
+                        idx = grade_positions[0]
+                        for k in range(idx + 1, min(idx + 30, len(ocr_data["text"]))):
+                            tok = self.normalize_grade_token(ocr_data["text"][k])
+                            if tok and tok in self.valid_grades:
                                 grade_value = tok
                                 break
                 
@@ -187,6 +288,7 @@ class FITREPExtractor:
                 
                 # Extract OCC - use text blocks to find form data areas
                 occ_value = None
+                occ_block_lines = None
                 
                 # Use same page object as the checkbox detection uses
                 page = doc[0]
@@ -221,6 +323,7 @@ class FITREPExtractor:
                                 normalized = self.normalize_token(line_clean)
                                 if normalized in self.valid_occ_codes:
                                     occ_value = normalized
+                                    occ_block_lines = text_lines
                                     break
                             
                             if occ_value:
@@ -228,6 +331,17 @@ class FITREPExtractor:
                 
                 if occ_value:
                     data['occ'] = occ_value
+
+                # If Grade still missing, try to pull it from the same OCC block context
+                if not data.get('grade') and occ_block_lines:
+                    for line in occ_block_lines:
+                        for tok in re.findall(r"[A-Z0-9]+", line.upper()):
+                            nt = self.normalize_grade_token(tok)
+                            if nt in self.valid_grades:
+                                data['grade'] = nt
+                                break
+                        if data.get('grade'):
+                            break
                 
                 # Extract To date - use the same text block approach as OCC
                 to_value = None
@@ -293,6 +407,38 @@ class FITREPExtractor:
                 
                 if to_value:
                     data['to_date'] = to_value
+
+                # Additional Grade heuristic: look near Marine's last name line in page text
+                if not data.get('grade') and data.get('last_name'):
+                    try:
+                        page0 = doc[0]
+                        text_dict2 = page0.get_text("dict")
+                        lname = data['last_name'].upper()
+                        page_height = float(page0.rect.height)
+                        top_third_limit = page_height / 3.0
+                        target_ys = []
+                        # Find Y positions of lines containing the last name token
+                        for block in text_dict2.get("blocks", []):
+                            for line in block.get("lines", []):
+                                line_text = "".join(span.get("text", "") for span in line.get("spans", []))
+                                if lname in line_text.upper():
+                                    y_line = line.get("bbox", [0, 0, 0, 0])[1]
+                                    if y_line <= top_third_limit:
+                                        target_ys.append(y_line)
+                        # Search same/nearby lines for a grade token
+                        for block in text_dict2.get("blocks", []):
+                            for line in block.get("lines", []):
+                                y_top = line.get("bbox", [0, 0, 0, 0])[1]
+                                if any(abs(y_top - ty) <= 20 for ty in target_ys):
+                                    for span in line.get("spans", []):
+                                        tok = self.normalize_grade_token(span.get("text", ""))
+                                        if tok in self.valid_grades:
+                                            data['grade'] = tok
+                                            raise StopIteration
+                    except StopIteration:
+                        pass
+                    except Exception:
+                        pass
                 
                 # Check for Not Observed
                 not_observed = self.check_not_observed(img, text1)
@@ -874,8 +1020,9 @@ class FITREPExtractor:
         for pdf_file in pdf_files:
             self.process_single_pdf(pdf_file)
         
-        # Sort results by Grade (military rank), then by last name
-        self.results.sort(key=lambda x: (self.rank_sort_key(x[1]), x[0]))
+        # Sort results by Grade (military rank), then by Last Name, then FITREP ID
+        # row layout: [fitrep_id, last_name, grade, ...]
+        self.results.sort(key=lambda x: (self.rank_sort_key(x[2]), x[1], x[0]))
         
         end_time = time.time()
         total_time = end_time - self.start_time
