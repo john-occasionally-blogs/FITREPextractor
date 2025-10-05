@@ -860,9 +860,13 @@ class FITREPExtractor:
             lines = text.split('\n')
             for i, line in enumerate(lines):
                 if 'Not Observed' in line:
-                    check_lines = lines[i:i+3]
+                    # Look a bit further down to catch the isolated X block
+                    # Include up to 4 lines below the label line
+                    check_lines = lines[i:i+5]
                     for check_line in check_lines:
-                        if 'X' in check_line and 'Extended' not in check_line:
+                        lc = check_line.lower()
+                        # Match an X/x near the checkbox, ignore "Extended" context
+                        if 'x' in lc and 'extended' not in lc:
                             if len(check_line) < 50:
                                 return True
         return False
