@@ -131,6 +131,15 @@ class FITREPExtractor:
                     name_data = self.extract_rs_ro_names(text1)
                     if name_data:
                         data.update(name_data)
+
+                # Marine last name - anchor on Marine EDIPI line and walk up lines
+                try:
+                    if edipi_data and edipi_data.get('marine_edipi'):
+                        mname = self.extract_marine_last_name_by_edipi(doc, edipi_data['marine_edipi'])
+                        if mname:
+                            data['last_name'] = mname
+                except Exception:
+                    pass
                 
                 # Extract Grade - fixed-region OCR (simple + accurate) with text fallback
                 grade_value = None
@@ -951,6 +960,67 @@ class FITREPExtractor:
                 values.append(4)  # Default to D
         
         return values
+
+    def extract_marine_last_name_by_edipi(self, pdf_doc, marine_edipi):
+        """Extract Marine's last name by locating the Marine EDIPI on page 1 and walking upwards.
+
+        Heuristic observed pattern:
+        - Top of page lists LASTNAME on its own line, then FIRSTNAME on next line,
+          followed by a line containing EDIPI and GRADE (e.g., "1175778370 CAPT").
+        - We find the line containing the Marine EDIPI and then look 1–5 lines above
+          for uppercase alpha-only tokens; the upper of the nearest two tokens is
+          the last name. If only one candidate exists, use it.
+        """
+        if len(pdf_doc) == 0:
+            return None
+
+        page = pdf_doc[0]
+        text = page.get_text() or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        # Locate the line index that contains the given EDIPI
+        idx = None
+        for i, ln in enumerate(lines):
+            if marine_edipi in ln:
+                idx = i
+                break
+        if idx is None:
+            return None
+
+        # Collect up to a few candidate name tokens above the EDIPI line
+        field_labels = {
+            'FITREP', 'ID', 'FITNESS', 'REPORT', 'REPORTING', 'SENIOR', 'REVIEWING',
+            'SERVICE', 'USMC', 'ANG', 'USA', 'AFNG', 'USAF', 'USN', 'FMS', 'USCG', 'USSF',
+            'GRADE', 'RANK', 'DUTY', 'ASSIGNMENT', 'INITIALS'
+        }
+        valid_grades = set(self.valid_grades)
+        valid_occ = set(self.valid_occ_codes)
+
+        candidates = []
+        for j in range(max(0, idx - 6), idx):
+            token = lines[j].strip()
+            token_u = token.upper()
+            # Accept single-word, alpha-only, uppercase strings of length >=2
+            if token_u.isalpha() and token_u == token and len(token_u) >= 2:
+                if token_u not in field_labels and token_u not in valid_grades and token_u not in valid_occ:
+                    candidates.append((j, token_u))
+
+        if not candidates:
+            return None
+
+        # Sort by proximity (closest first going upwards)
+        candidates.sort(key=lambda t: abs(idx - t[0]))
+
+        # If we have two consecutive name lines above the EDIPI, pick the upper one as last name
+        # Example order walking upwards: [FIRSTNAME, LASTNAME]
+        # candidates currently sorted by proximity (nearest first); reconstruct in page order
+        # for the nearest two above.
+        nearest = sorted([c for c in candidates if c[0] < idx], key=lambda t: t[0], reverse=True)
+        if len(nearest) >= 2:
+            # nearest[0] is first name line, nearest[1] is last name line
+            return nearest[1][1]
+        # Otherwise fallback to the only candidate
+        return nearest[0][1]
 
     def rank_sort_key(self, grade):
         """Return sort key for military ranks"""
