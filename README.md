@@ -135,6 +135,8 @@ if extractor.process_directory(Path("/path/to/pdf/dir")):
     extractor.save_to_csv(Path("/tmp/fitrep_extract.csv"))
 ```
 
+See also example script: `examples/smoke_test_bytes.py` for a minimal sync/async bytes-based invocation that prints the extracted JSON.
+
 ## 📁 Project Structure
 
 - `fitrep_extractor.py` — main extractor and only required entry point.
