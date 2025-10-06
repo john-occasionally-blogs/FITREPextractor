@@ -99,6 +99,29 @@ async def run():
 asyncio.run(run())
 ```
 
+Bytes (when you receive the PDF as bytes):
+
+```python
+from fitrep_extractor import FITREPExtractor
+
+# pdf_bytes = request.body, message payload, etc.
+data = FITREPExtractor().extract_from_bytes(pdf_bytes)
+```
+
+Async with bytes:
+
+```python
+import asyncio
+from fitrep_extractor import FITREPExtractor
+
+async def run_bytes(pdf_bytes: bytes):
+    extractor = FITREPExtractor()
+    data = await extractor.extract_fitrep_data_bytes(pdf_bytes)
+    print(data)
+
+# asyncio.run(run_bytes(pdf_bytes))
+```
+
 Batch (programmatic directory processing):
 
 ```python

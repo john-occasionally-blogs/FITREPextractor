@@ -60,14 +60,11 @@ class FITREPExtractor:
                 indices.append(i)
         return indices
     
-    def extract_from_pdf(self, pdf_path):
-        """Extract required data from a single PDF file using OCR"""
+    def _extract_from_document(self, doc, label="document"):
+        """Core extraction from an open PyMuPDF document. Returns dict or None."""
         try:
             data = {}
-            
-            # Open PDF with PyMuPDF
-            doc = fitz.open(str(pdf_path))
-            
+
             # Process Page 1
             if len(doc) > 0:
                 page = doc[0]
@@ -452,7 +449,7 @@ class FITREPExtractor:
                 # Check for Not Observed
                 not_observed = self.check_not_observed(img, text1)
                 if not_observed:
-                    print("  Skipping {0} - Not Observed is checked".format(pdf_path.name))
+                    print("  Skipping {0} - Not Observed is checked".format(label))
                     doc.close()
                     return None
             
@@ -476,7 +473,7 @@ class FITREPExtractor:
             data['page4_values'] = page4_values if page4_values else [4] * 4
             
             doc.close()
-            
+
             # Debug output
             print("  Extracted - Last Name: {0}, Grade: {1}, OCC: {2}, To: {3}".format(
                 data.get('last_name'), data.get('grade'), data.get('occ'), data.get('to_date')))
@@ -484,16 +481,49 @@ class FITREPExtractor:
             return data
             
         except Exception as e:
-            print("Error processing {0}: {1}".format(pdf_path, str(e)))
+            print("Error processing {0}: {1}".format(label, str(e)))
             import traceback
             traceback.print_exc()
             return None
+
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    def extract_from_pdf(self, pdf_path):
+        """Extract required data from a single PDF file using OCR"""
+        try:
+            doc = fitz.open(str(pdf_path))
+        except Exception as e:
+            print("Error opening {0}: {1}".format(pdf_path, str(e)))
+            import traceback
+            traceback.print_exc()
+            return None
+        label = getattr(pdf_path, 'name', str(pdf_path))
+        return self._extract_from_document(doc, label=label)
+
+    def extract_from_bytes(self, pdf_bytes):
+        """Extract data from in-memory PDF bytes. Returns dict or None."""
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        except Exception as e:
+            print("Error opening <bytes>: {0}".format(str(e)))
+            import traceback
+            traceback.print_exc()
+            return None
+        return self._extract_from_document(doc, label="<bytes>")
 
     async def extract_fitrep_data(self, pdf_path):
         """
         Async wrapper for extract_from_pdf - provides API interface for pdf-processor service
         """
         return self.extract_from_pdf(pdf_path)
+
+    async def extract_fitrep_data_bytes(self, pdf_bytes):
+        """Async wrapper for bytes-based extraction for API/microservice use."""
+        return self.extract_from_bytes(pdf_bytes)
 
     def extract_reporting_senior_info(self, text, ocr_data):
         """Extract Reporting Senior name, rank, and EDIPI from the PDF"""
