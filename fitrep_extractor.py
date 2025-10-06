@@ -488,7 +488,13 @@ class FITREPExtractor:
             import traceback
             traceback.print_exc()
             return None
-    
+
+    async def extract_fitrep_data(self, pdf_path):
+        """
+        Async wrapper for extract_from_pdf - provides API interface for pdf-processor service
+        """
+        return self.extract_from_pdf(pdf_path)
+
     def extract_reporting_senior_info(self, text, ocr_data):
         """Extract Reporting Senior name, rank, and EDIPI from the PDF"""
         rs_info = {}
@@ -970,7 +976,7 @@ class FITREPExtractor:
 
         Heuristic observed pattern:
         - Top of page lists LASTNAME on its own line, then FIRSTNAME on next line,
-          followed by a line containing EDIPI and GRADE (e.g., "1175778370 CAPT").
+          followed by a line containing EDIPI and GRADE (e.g., "1234567890 CAPT").
         - We find the line containing the Marine EDIPI and then look 1–5 lines above
           for uppercase alpha-only tokens; the upper of the nearest two tokens is
           the last name. If only one candidate exists, use it.
