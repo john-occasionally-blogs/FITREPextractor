@@ -62,6 +62,56 @@ The script will prompt you to choose:
 2. Run the script and select option 'a'
 3. All PDFs will be processed automatically
 
+## 🧩 Programmatic Usage (Microservice/Webapp)
+
+You can call the extractor directly from Python without using the CLI.
+
+Sync (returns a dict of extracted fields):
+
+```python
+from pathlib import Path
+from fitrep_extractor import FITREPExtractor
+
+extractor = FITREPExtractor()
+pdf_path = Path("/path/to/file.pdf")
+
+data = extractor.extract_from_pdf(pdf_path)
+if data:
+    # Example keys that may be present:
+    # 'fitrep_id', 'last_name', 'grade', 'occ', 'to_date',
+    # 'marine_edipi', 'rs_last_name', 'rs_edipi', 'ro_last_name', 'ro_edipi',
+    # 'page2_values', 'page3_values', 'page4_values'
+    print(data)
+```
+
+Async (awaitable wrapper suitable for async services):
+
+```python
+import asyncio
+from pathlib import Path
+from fitrep_extractor import FITREPExtractor
+
+async def run():
+    extractor = FITREPExtractor()
+    data = await extractor.extract_fitrep_data(Path("/path/to/file.pdf"))
+    print(data)
+
+asyncio.run(run())
+```
+
+Batch (programmatic directory processing):
+
+```python
+from pathlib import Path
+from fitrep_extractor import FITREPExtractor
+
+extractor = FITREPExtractor()
+if extractor.process_directory(Path("/path/to/pdf/dir")):
+    # Results are stored on extractor.results as rows (no headers)
+    # You can also write them to CSV:
+    extractor.save_to_csv(Path("/tmp/fitrep_extract.csv"))
+```
+
 ## 📁 Project Structure
 
 - `fitrep_extractor.py` — main extractor and only required entry point.
