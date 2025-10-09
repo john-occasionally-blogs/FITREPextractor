@@ -891,21 +891,81 @@ class FITREPExtractor:
         return ro_info if ro_info else None
     
     def check_not_observed(self, img, text):
-        """Check if Not Observed checkbox is marked"""
-        if 'Not Observed' in text:
-            lines = text.split('\n')
-            for i, line in enumerate(lines):
-                if 'Not Observed' in line:
-                    # Look a bit further down to catch the isolated X block
-                    # Include up to 4 lines below the label line
-                    check_lines = lines[i:i+5]
-                    for check_line in check_lines:
-                        lc = check_line.lower()
-                        # Match an X/x near the checkbox, ignore "Extended" context
-                        if 'x' in lc and 'extended' not in lc:
-                            if len(check_line) < 50:
-                                return True
-        return False
+        """Check if Not Observed checkbox is marked using position-aware OCR.
+
+        Strategy:
+        - Use OCR tokens with coordinates to find the horizontal centers of
+          labels "Adverse", "Not Observed", and "Extended" (columns a/b/c).
+        - In the band below those labels, locate any isolated X marks or
+          bracketed variants (e.g., "X", "[x]").
+        - Determine if the X nearest to the Not Observed column center is
+          within a reasonable tolerance, indicating that b. Not Observed is
+          the checked option. This avoids flagging when only c. Extended is
+          checked.
+        """
+        try:
+            # OCR with positional data
+            ocr = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            n = len(ocr.get('text', []))
+            if n == 0:
+                return False
+
+            # Locate label centers and reference Y for the label row
+            import re as _re
+            centers = {}
+            label_y = None
+            for i in range(n):
+                t = (ocr['text'][i] or '').strip()
+                if not t:
+                    continue
+                # a. Adverse
+                if _re.fullmatch(r"Adverse", t, flags=_re.I):
+                    centers['adverse'] = ocr['left'][i] + ocr['width'][i] / 2.0
+                    label_y = ocr['top'][i]
+                # b. Not Observed (split across two tokens: Not + Observed)
+                if _re.fullmatch(r"Not", t, flags=_re.I):
+                    j = i + 1
+                    if j < n:
+                        t2 = (ocr['text'][j] or '').strip()
+                        if _re.fullmatch(r"Observed", t2, flags=_re.I) and abs(ocr['top'][j] - ocr['top'][i]) < 12:
+                            centers['not_observed'] = (ocr['left'][i] + (ocr['left'][j] + ocr['width'][j])) / 2.0
+                            label_y = ocr['top'][i]
+                # c. Extended
+                if _re.fullmatch(r"Extended", t, flags=_re.I):
+                    centers['extended'] = ocr['left'][i] + ocr['width'][i] / 2.0
+                    label_y = ocr['top'][i]
+
+            # Require the Not Observed label center to be found to proceed
+            if 'not_observed' not in centers or label_y is None:
+                return False
+
+            # Collect X marks in a band below the label row
+            x_marks = []
+            for i in range(n):
+                t = (ocr['text'][i] or '').strip()
+                if not t:
+                    continue
+                # Candidate tokens indicating a mark
+                if (_re.fullmatch(r"\[?\s*[xX]\s*\]?", t)
+                    or t in ('X', 'x', '[x]', '[X]', 'x]', '[x', '[ X', '[X')
+                    or ('x' in t.lower() and len(t) <= 3)):
+                    dy = ocr['top'][i] - label_y
+                    if 0 <= dy <= 120:  # within reasonable distance below labels
+                        cx = ocr['left'][i] + ocr['width'][i] / 2.0
+                        x_marks.append((cx, ocr['top'][i]))
+
+            if not x_marks:
+                return False
+
+            # Determine if an X is near the Not Observed column center
+            target = centers['not_observed']
+            nearest = min(x_marks, key=lambda a: abs(a[0] - target))
+            # Tolerance chosen based on empirical spacing across sample PDFs
+            return abs(nearest[0] - target) < 80
+
+        except Exception:
+            # If anything goes wrong, be conservative and do not mark as Not Observed
+            return False
     
     def extract_checkbox_values_text_based(self, pdf_doc, page_num, expected_count):
         """Extract checkbox values using direct PDF text extraction - much more reliable"""
