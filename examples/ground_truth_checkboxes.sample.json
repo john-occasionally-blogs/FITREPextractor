@@ -1,0 +1,13 @@
+[
+  {
+    "path": "/absolute/path/to/fitrep.pdf",
+    "expected": [a,b,c,d,e, f,g,h,i,j, k,l,m,n]
+  }
+]
+
+// Notes:
+// - Provide the absolute path to a PDF and the 14 checkbox values
+//   as a single list (Pages 2–4 concatenated: 5 + 5 + 4).
+// - Save your real manifest as examples/ground_truth_checkboxes.json
+//   (it is ignored by git to protect sensitive data).
+
