@@ -7,3 +7,8 @@ fitrep_extract_*.csv
 Cleanup/*.csv
 Cleanup/pdf_structure.json
 *.pdf
+__pycache__/
+.DS_Store
+*.dmg
+examples/debug_cells/
+Cleanup/
