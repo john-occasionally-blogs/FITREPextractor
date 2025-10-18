@@ -20,6 +20,6 @@ Usage
    PYTHONPATH=. python3 examples/verify_checkboxes.py
 
 Notes
-- The manifest and any optional overrides JSON are git-ignored to avoid committing sensitive data.
+- The manifest is git-ignored to avoid committing sensitive data.
+- The extractor never applies hardcoded results keyed by FITREP ID; use the verifier to compare outputs.
 - You can set `FITREP_CHECKBOX_FALLBACK=auto` to enable the guarded OCR fallback during development.
-

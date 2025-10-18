@@ -2,3 +2,8 @@
 examples/ground_truth_checkboxes.json
 examples/checkbox_overrides.json
 
+# Generated extracts may contain PII; do not commit
+fitrep_extract_*.csv
+Cleanup/*.csv
+Cleanup/pdf_structure.json
+*.pdf

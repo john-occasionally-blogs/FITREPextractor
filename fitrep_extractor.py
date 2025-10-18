@@ -29,6 +29,8 @@ class FITREPExtractor:
         # - auto: use OCR fallback only when text-based looks suspicious
         # - force: always use OCR fallback for pages 2–4
         self.checkbox_fallback_mode = os.getenv('FITREP_CHECKBOX_FALLBACK', 'off').lower()
+        # Strict mode: do not silently substitute default checkbox values when uncertain
+        self.strict_no_defaults = str(os.getenv('FITREP_STRICT', 'true')).lower() in {'1','true','yes','on'}
         # Valid military grades
         self.valid_grades = [
             'SGT', 'SSGT', 'GYSGT', 'MSGT', 'MGYSGT', '1STSGT', 'SGTMAJ',
@@ -463,36 +465,23 @@ class FITREPExtractor:
             page2_values = []
             if len(doc) > 1:
                 page2_values = self.extract_checkbox_values_auto(doc, 1, 5)
-            data['page2_values'] = page2_values if page2_values else [4] * 5
+            data['page2_values'] = page2_values if page2_values else None
             
             # Process Page 3 - 5 checkbox values
             page3_values = []
             if len(doc) > 2:
                 page3_values = self.extract_checkbox_values_auto(doc, 2, 5)
-            data['page3_values'] = page3_values if page3_values else [4] * 5
+            data['page3_values'] = page3_values if page3_values else None
             
             # Process Page 4 - 4 checkbox values
             page4_values = []
             if len(doc) > 3:
                 page4_values = self.extract_checkbox_values_auto(doc, 3, 4)
-            data['page4_values'] = page4_values if page4_values else [4] * 4
+            data['page4_values'] = page4_values if page4_values else None
 
-            # Apply verified ground-truth overrides from JSON if provided
-            try:
-                fid = str(data.get('fitrep_id', '')).strip()
-                overrides_path = os.getenv('FITREP_CHECKBOX_OVERRIDES')
-                if not overrides_path:
-                    candidate = Path(__file__).parent / 'examples' / 'checkbox_overrides.json'
-                    overrides_path = str(candidate) if candidate.exists() else None
-                if overrides_path and fid:
-                    import json
-                    with open(overrides_path, 'r') as f:
-                        ov = json.load(f)
-                    if fid in ov:
-                        for k, v in ov[fid].items():
-                            data[k] = v
-            except Exception:
-                pass
+            # Do not apply any overrides keyed by FITREP ID.
+            # Verification against known values should be performed via example scripts,
+            # not by mutating extracted results.
             
             doc.close()
 
@@ -1217,6 +1206,737 @@ class FITREPExtractor:
         except Exception:
             return [4] * expected_count
 
+    def extract_checkbox_values_vector_paths(self, pdf_doc, page_num, expected_count):
+        """
+        Vector-graphics fallback: detect drawn X-marks from PDF line segments.
+        - Finds the A–H header via PDF text and computes column centers.
+        - Uses page.get_drawings() to collect diagonal line segments.
+        - Clusters intersecting diagonal pairs into X centers and maps them to columns.
+        """
+        try:
+            if page_num >= len(pdf_doc):
+                return [4] * expected_count
+
+            page = pdf_doc[page_num]
+
+            # 1) Find A–H header via PDF text
+            text = page.get_text("dict")
+            letter_spans = []
+            for block in text.get("blocks", []):
+                for line in block.get("lines", []):
+                    for sp in line.get("spans", []):
+                        s = (sp.get("text", "") or "").strip()
+                        if len(s) == 1 and s in "ABCDEFGH":
+                            (x0, y0, x1, y1) = sp.get("bbox", [0, 0, 0, 0])
+                            letter_spans.append({
+                                'ch': s,
+                                'x': (x0 + x1) / 2.0,
+                                'y': (y0 + y1) / 2.0,
+                            })
+
+            if not letter_spans:
+                return [4] * expected_count
+
+            letter_spans.sort(key=lambda a: a['y'])
+            rows = []
+            cur = [letter_spans[0]]
+            for it in letter_spans[1:]:
+                if abs(it['y'] - cur[0]['y']) < 6:  # tight row tolerance in PDF coords
+                    cur.append(it)
+                else:
+                    rows.append(cur)
+                    cur = [it]
+            if cur:
+                rows.append(cur)
+
+            best_row = None
+            best_unique = -1
+            for r in rows:
+                uniq = {a['ch'] for a in r}
+                if len(uniq) >= 6:
+                    xs = [a['x'] for a in r]
+                    if xs and (max(xs) - min(xs)) > 150:
+                        if len(uniq) > best_unique:
+                            best_row = r
+                            best_unique = len(uniq)
+
+            if not best_row:
+                return [4] * expected_count
+
+            best_row.sort(key=lambda a: a['x'])
+            centers_map = {a['ch']: a['x'] for a in best_row}
+            letters = list('ABCDEFGH')
+            known = [(ch, centers_map[ch]) for ch in letters if ch in centers_map]
+            if not known:
+                return [4] * expected_count
+            known.sort(key=lambda a: a[1])
+            min_ch, min_x = known[0]
+            max_ch, max_x = known[-1]
+            idx_min = letters.index(min_ch)
+            idx_max = letters.index(max_ch)
+            span = max(idx_max - idx_min, 1)
+            step = (max_x - min_x) / span
+            ordered = []
+            for i, ch in enumerate(letters):
+                if ch in centers_map:
+                    ordered.append(centers_map[ch])
+                else:
+                    ordered.append(min_x + (i - idx_min) * step)
+
+            header_y = sum(a['y'] for a in best_row) / len(best_row)
+
+            # 2) Collect diagonal line segments from vector drawings
+            def diag_segments():
+                segs = []
+                for d in page.get_drawings():
+                    for it in d.get('items', []):
+                        op = it[0]
+                        if op == 'l':  # line
+                            p0, p1 = it[1], it[2]
+                            x0, y0 = float(p0[0]), float(p0[1])
+                            x1, y1 = float(p1[0]), float(p1[1])
+                            dx, dy = x1 - x0, y1 - y0
+                            if dx == 0:
+                                slope = None
+                            else:
+                                slope = abs(dy / dx)
+                            length = (dx*dx + dy*dy) ** 0.5
+                            # Heuristics: diagonal-ish, moderate length, below header
+                            if slope is not None and 0.5 <= slope <= 2.0 and 5 <= length <= 40:
+                                y_mid = (y0 + y1) / 2.0
+                                if header_y + 5 <= y_mid <= header_y + 450:
+                                    segs.append((x0, y0, x1, y1))
+                return segs
+
+            segs = diag_segments()
+            if not segs:
+                return [4] * expected_count
+
+            # 3) Find intersections between diagonal segment pairs to localize X centers
+            def intersects(a, b):
+                # Segment intersection test with tolerance
+                import math
+                (x1, y1, x2, y2) = a
+                (x3, y3, x4, y4) = b
+
+                def det(u1, v1, u2, v2):
+                    return u1 * v2 - v1 * u2
+
+                den = det(x1 - x2, y1 - y2, x3 - x4, y3 - y4)
+                if abs(den) < 1e-6:
+                    return None
+                px = det(det(x1, y1, x2, y2), x1 - x2, det(x3, y3, x4, y4), x3 - x4) / den
+                py = det(det(x1, y1, x2, y2), y1 - y2, det(x3, y3, x4, y4), y3 - y4) / den
+
+                def on_seg(xa, ya, xb, yb, px, py):
+                    return (min(xa, xb) - 1 <= px <= max(xa, xb) + 1 and
+                            min(ya, yb) - 1 <= py <= max(ya, yb) + 1)
+
+                if on_seg(x1, y1, x2, y2, px, py) and on_seg(x3, y3, x4, y4, px, py):
+                    return (px, py)
+                return None
+
+            pts = []
+            for i in range(len(segs)):
+                for j in range(i + 1, len(segs)):
+                    pt = intersects(segs[i], segs[j])
+                    if pt is not None:
+                        # only consider sufficiently crossing angles by checking vector dot product
+                        import math
+                        x1, y1, x2, y2 = segs[i]
+                        x3, y3, x4, y4 = segs[j]
+                        v1 = (x2 - x1, y2 - y1)
+                        v2 = (x4 - x3, y4 - y3)
+                        def norm(v):
+                            return (v[0]*v[0] + v[1]*v[1]) ** 0.5
+                        n1, n2 = norm(v1), norm(v2)
+                        if n1 > 0 and n2 > 0:
+                            cosang = abs((v1[0]*v2[0] + v1[1]*v2[1]) / (n1*n2))
+                            if cosang < 0.5:  # > ~60 degrees apart
+                                pts.append(pt)
+
+            if not pts:
+                return [4] * expected_count
+
+            # 4) Cluster intersection points by Y to get rows
+            pts.sort(key=lambda p: p[1])
+            rows = []
+            cur = [pts[0]]
+            for p in pts[1:]:
+                if abs(p[1] - cur[0][1]) < 18:
+                    cur.append(p)
+                else:
+                    rows.append(cur)
+                    cur = [p]
+            if cur:
+                rows.append(cur)
+
+            # choose one point per row (e.g., leftmost)
+            centers = [sorted(r, key=lambda a: a[0])[0] for r in rows[:expected_count]]
+
+            def col_from_x(x):
+                idx = min(range(len(ordered)), key=lambda k: abs(ordered[k] - x))
+                return idx + 1
+
+            values = [col_from_x(cx) for (cx, cy) in centers]
+            if len(values) < expected_count:
+                values += [4] * (expected_count - len(values))
+            return values
+        except Exception:
+            return [4] * expected_count
+
+    def extract_checkbox_values_image_peaks(self, pdf_doc, page_num, expected_count):
+        """
+        Image-based fallback: find per-row Y positions by vertical darkness peaks
+        per column, then pick the darkest column at each row.
+        Uses PDF text to locate A–H header and compute column centers, then
+        operates purely on the rendered grayscale image.
+        """
+        try:
+            if page_num >= len(pdf_doc):
+                return [4] * expected_count
+
+            page = pdf_doc[page_num]
+            # Build column centers via PDF text (A–H row)
+            text = page.get_text("dict")
+            spans = []
+            for block in text.get("blocks", []):
+                for line in block.get("lines", []):
+                    for sp in line.get("spans", []):
+                        s = (sp.get("text", "") or "").strip()
+                        if len(s) == 1 and s in "ABCDEFGH":
+                            (x0, y0, x1, y1) = sp.get("bbox", [0, 0, 0, 0])
+                            spans.append({'ch': s, 'x': (x0 + x1) / 2.0, 'y': (y0 + y1) / 2.0})
+            if not spans:
+                return [4] * expected_count
+            spans.sort(key=lambda a: a['y'])
+            rows = []
+            cur = [spans[0]]
+            for s in spans[1:]:
+                if abs(s['y'] - cur[0]['y']) < 6:
+                    cur.append(s)
+                else:
+                    rows.append(cur)
+                    cur = [s]
+            if cur:
+                rows.append(cur)
+            best = None
+            bestu = -1
+            for r in rows:
+                u = {a['ch'] for a in r}
+                if len(u) >= 6:
+                    xs = [a['x'] for a in r]
+                    if xs and (max(xs) - min(xs)) > 150 and len(u) > bestu:
+                        best = r
+                        bestu = len(u)
+            if not best:
+                return [4] * expected_count
+            best.sort(key=lambda a: a['x'])
+            centers_map = {a['ch']: a['x'] for a in best}
+            letters = list('ABCDEFGH')
+            known = [(ch, centers_map[ch]) for ch in letters if ch in centers_map]
+            known.sort(key=lambda a: a[1])
+            min_ch, min_x = known[0]
+            max_ch, max_x = known[-1]
+            idx_min = letters.index(min_ch)
+            idx_max = letters.index(max_ch)
+            span = max(idx_max - idx_min, 1)
+            step = (max_x - min_x) / span
+            centers_pts = []
+            for i, ch in enumerate(letters):
+                if ch in centers_map:
+                    centers_pts.append(centers_map[ch])
+                else:
+                    centers_pts.append(min_x + (i - idx_min) * step)
+            header_y_pt = sum(a['y'] for a in best) / len(best)
+
+            # Render page and map points to pixels (scale=3)
+            mat = fitz.Matrix(3, 3)
+            pix = page.get_pixmap(matrix=mat)
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(pix.tobytes("png"))).convert('L')
+            scale = 3.0
+            centers_px = [int(x * scale) for x in centers_pts]
+            header_y_px = int(header_y_pt * scale)
+
+            # For each column, compute vertical X-correlation profile using diagonal kernels
+            import numpy as np
+            arr = np.array(img)
+            H, W = arr.shape
+            y_start = min(max(header_y_px + 40, 0), H - 1)
+            band = arr[y_start:H, :]
+            dark_full = 255 - band
+
+            ksz = 21
+            half = ksz // 2
+            # Build diagonal kernels (positive and negative slope) with thickness 2
+            k_pos = np.zeros((ksz, ksz), dtype=np.float32)
+            k_neg = np.zeros((ksz, ksz), dtype=np.float32)
+            for i in range(ksz):
+                j = i
+                for t in (-1, 0, 1):
+                    jj = j + t
+                    if 0 <= jj < ksz:
+                        k_pos[i, jj] = 1.0
+                j2 = ksz - 1 - i
+                for t in (-1, 0, 1):
+                    jj2 = j2 + t
+                    if 0 <= jj2 < ksz:
+                        k_neg[i, jj2] = 1.0
+            # Normalize kernels
+            k_pos /= k_pos.sum() or 1.0
+            k_neg /= k_neg.sum() or 1.0
+
+            half_w = half
+            col_profiles = []
+            for cx in centers_px:
+                x0 = max(0, cx - half_w)
+                x1 = min(W, cx + half_w + 1)
+                strip = dark_full[:, x0:x1]
+                # Pad vertically to compute patch correlations
+                vlen = strip.shape[0]
+                scores = np.zeros(vlen, dtype=np.float32)
+                # Convolve per y by extracting local patches
+                for y in range(vlen):
+                    y0 = y - half
+                    y1 = y + half + 1
+                    if y0 < 0 or y1 > vlen:
+                        continue
+                    patch = strip[y0:y1, :]
+                    if patch.shape[0] != ksz or patch.shape[1] != ksz:
+                        continue
+                    s = (patch * k_pos).sum() + (patch * k_neg).sum()
+                    scores[y] = s
+                # Smooth slightly
+                k = np.ones(15, dtype=np.float32)
+                v2 = np.convolve(scores, k, mode='same')
+                col_profiles.append(v2)
+
+            # Detect peaks across columns and cluster into rows
+            # Collect candidate peaks per column
+            peaks = []
+            min_sep = 50
+            for ci, v in enumerate(col_profiles):
+                # simple peak picking: local maxima with minimal separation
+                last_y = -9999
+                for y in range(1, len(v) - 1):
+                    if v[y] > v[y-1] and v[y] >= v[y+1]:
+                        if v[y] > 0:  # any darkness
+                            if y - last_y >= min_sep:
+                                peaks.append((y, ci, int(v[y])))
+                                last_y = y
+
+            if not peaks:
+                return [4] * expected_count
+
+            # Cluster peaks by y with tolerance to form rows
+            peaks.sort(key=lambda a: a[0])
+            rows = []
+            cur = [peaks[0]]
+            for p in peaks[1:]:
+                if abs(p[0] - cur[0][0]) < 25:
+                    cur.append(p)
+                else:
+                    rows.append(cur)
+                    cur = [p]
+            if cur:
+                rows.append(cur)
+
+            # Score each row by total darkness and keep top expected_count rows
+            rows_scored = []
+            for r in rows:
+                score = sum(p[2] for p in r)
+                rows_scored.append((score, r))
+            rows_scored.sort(key=lambda a: a[0], reverse=True)
+            chosen = rows_scored[:expected_count]
+            # Order by y ascending
+            chosen_sorted = sorted(chosen, key=lambda a: a[1][0][0])
+
+            values = []
+            for _, r in chosen_sorted:
+                # pick column with max peak in this row cluster
+                best = max(r, key=lambda p: p[2])
+                col_idx = best[1]
+                values.append(col_idx + 1)  # 1..8
+
+            if len(values) < expected_count:
+                values += [4] * (expected_count - len(values))
+            return values
+        except Exception:
+            return [4] * expected_count
+
+    def extract_checkbox_values_row_bands(self, pdf_doc, page_num, expected_count):
+        """
+        Image-based fallback focusing on row detection:
+        - Build diagonal X correlation per column as in image_peaks.
+        - Sum across columns to get a per-Y row energy curve.
+        - Select top expected_count peaks as row centers (with separation).
+        - For each row center, choose the column with the highest diagonal score.
+        """
+        try:
+            if page_num >= len(pdf_doc):
+                return [4] * expected_count
+
+            page = pdf_doc[page_num]
+
+            # Centers from A–H PDF text
+            text = page.get_text("dict")
+            spans = []
+            for block in text.get("blocks", []):
+                for line in block.get("lines", []):
+                    for sp in line.get("spans", []):
+                        s = (sp.get("text", "") or "").strip()
+                        if len(s) == 1 and s in "ABCDEFGH":
+                            (x0, y0, x1, y1) = sp.get("bbox", [0, 0, 0, 0])
+                            spans.append({'ch': s, 'x': (x0 + x1) / 2.0, 'y': (y0 + y1) / 2.0})
+            if not spans:
+                return [4] * expected_count
+            spans.sort(key=lambda a: a['y'])
+            rows = []
+            cur = [spans[0]]
+            for s in spans[1:]:
+                if abs(s['y'] - cur[0]['y']) < 6:
+                    cur.append(s)
+                else:
+                    rows.append(cur)
+                    cur = [s]
+            if cur:
+                rows.append(cur)
+            best = None
+            bestu = -1
+            for r in rows:
+                u = {a['ch'] for a in r}
+                if len(u) >= 6:
+                    xs = [a['x'] for a in r]
+                    if xs and (max(xs) - min(xs)) > 150 and len(u) > bestu:
+                        best = r
+                        bestu = len(u)
+            if not best:
+                return [4] * expected_count
+            best.sort(key=lambda a: a['x'])
+            letters = list('ABCDEFGH')
+            centers_map = {a['ch']: a['x'] for a in best}
+            known = [(ch, centers_map[ch]) for ch in letters if ch in centers_map]
+            known.sort(key=lambda a: a[1])
+            min_ch, min_x = known[0]
+            max_ch, max_x = known[-1]
+            idx_min = letters.index(min_ch)
+            idx_max = letters.index(max_ch)
+            span = max(idx_max - idx_min, 1)
+            step = (max_x - min_x) / span
+            centers_pts = []
+            for i, ch in enumerate(letters):
+                if ch in centers_map:
+                    centers_pts.append(centers_map[ch])
+                else:
+                    centers_pts.append(min_x + (i - idx_min) * step)
+            header_y_pt = sum(a['y'] for a in best) / len(best)
+
+            # Render page to grayscale
+            mat = fitz.Matrix(3, 3)
+            pix = page.get_pixmap(matrix=mat)
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(pix.tobytes("png"))).convert('L')
+            scale = 3.0
+            centers_px = [int(x * scale) for x in centers_pts]
+            header_y_px = int(header_y_pt * scale)
+
+            import numpy as np
+            arr = np.array(img)
+            H, W = arr.shape
+            y0 = min(max(header_y_px + 40, 0), H - 1)
+            band = arr[y0:H, :]
+            dark = 255 - band
+
+            # Diagonal kernels
+            ksz = 19
+            half = ksz // 2
+            k_pos = np.zeros((ksz, ksz), dtype=np.float32)
+            k_neg = np.zeros((ksz, ksz), dtype=np.float32)
+            for i in range(ksz):
+                j = i
+                for t in (-1, 0, 1):
+                    jj = j + t
+                    if 0 <= jj < ksz:
+                        k_pos[i, jj] = 1.0
+                j2 = ksz - 1 - i
+                for t in (-1, 0, 1):
+                    jj2 = j2 + t
+                    if 0 <= jj2 < ksz:
+                        k_neg[i, jj2] = 1.0
+            k_pos /= k_pos.sum() or 1.0
+            k_neg /= k_neg.sum() or 1.0
+
+            # Column correlation profiles
+            half_w = half
+            col_profiles = []
+            for cx in centers_px:
+                x0c = max(0, cx - half_w)
+                x1c = min(W, cx + half_w + 1)
+                strip = dark[:, x0c:x1c]
+                vlen = strip.shape[0]
+                scores = np.zeros(vlen, dtype=np.float32)
+                for yi in range(vlen):
+                    yb = yi - half
+                    ye = yi + half + 1
+                    if yb < 0 or ye > vlen:
+                        continue
+                    patch = strip[yb:ye, :]
+                    if patch.shape[0] != ksz or patch.shape[1] != ksz:
+                        continue
+                    s = (patch * k_pos).sum() + (patch * k_neg).sum()
+                    scores[yi] = s
+                # Smooth
+                k = np.ones(13, dtype=np.float32)
+                v2 = np.convolve(scores, k, mode='same')
+                col_profiles.append(v2)
+
+            # Row energy by summing across columns
+            row_energy = np.sum(np.vstack(col_profiles), axis=0)
+            # Peak picking with separation
+            peaks = []
+            last = -9999
+            min_sep = 45
+            for y in range(1, len(row_energy) - 1):
+                if row_energy[y] > row_energy[y-1] and row_energy[y] >= row_energy[y+1]:
+                    if y - last >= min_sep:
+                        peaks.append((row_energy[y], y))
+                        last = y
+            if not peaks:
+                return [4] * expected_count
+            # Take top expected_count peaks
+            peaks.sort(key=lambda a: a[0], reverse=True)
+            chosen = sorted(peaks[:expected_count], key=lambda a: a[1])
+
+            # Choose column per chosen row using simple darkness in a local box
+            values = []
+            box_h = 28
+            box_w = 28
+            for _, y in chosen:
+                # y is relative to band; map to absolute pixel in arr
+                yy = y0 + y
+                scores = []
+                for cx in centers_px:
+                    x0b = max(0, cx - box_w//2)
+                    x1b = min(W, cx + box_w//2)
+                    y0b = max(0, yy - box_h//2)
+                    y1b = min(H, yy + box_h//2)
+                    crop = arr[y0b:y1b, x0b:x1b]
+                    dark_score = int((255 - crop).sum())
+                    scores.append(dark_score)
+                col_idx = int(np.argmax(scores))
+                values.append(col_idx + 1)
+
+            if len(values) < expected_count:
+                values += [4] * (expected_count - len(values))
+            return values
+        except Exception:
+            return [4] * expected_count
+
+    def debug_checkbox_diagnostics(self, pdf_doc, page_num, expected_count):
+        """
+        Produce numeric diagnostics for checkbox detection without PII:
+        - header_y_px (int)
+        - centers_px (8 ints)
+        - row_energy_peaks (top K [score, y])
+        - chosen_rows_y (expected_count y's)
+        - col_darkness_per_row: list of per-column darkness scores per chosen row
+        - values_row_bands: values chosen by row-band method
+        - values_text_based: values from text-based method
+        """
+        info = {
+            'header_y_px': None,
+            'centers_px': [],
+            'row_energy_peaks': [],
+            'chosen_rows_y': [],
+            'col_darkness_per_row': [],
+            'values_row_bands': [],
+            'values_text_based': [],
+        }
+        try:
+            if page_num >= len(pdf_doc):
+                return info
+            # Always include baseline text-based values
+            info['values_text_based'] = self.extract_checkbox_values_text_based(pdf_doc, page_num, expected_count)
+            # 1) Centers from A–H PDF text
+            page = pdf_doc[page_num]
+            text = page.get_text("dict")
+            spans = []
+            for block in text.get("blocks", []):
+                for line in block.get("lines", []):
+                    for sp in line.get("spans", []):
+                        s = (sp.get("text", "") or "").strip()
+                        if len(s) == 1 and s in "ABCDEFGH":
+                            (x0, y0, x1, y1) = sp.get("bbox", [0, 0, 0, 0])
+                            spans.append({'ch': s, 'x': (x0 + x1) / 2.0, 'y': (y0 + y1) / 2.0})
+            if not spans:
+                # Fallback: OCR to find A–H header letters
+                mat = fitz.Matrix(3, 3)
+                pix = page.get_pixmap(matrix=mat)
+                img_ocr = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr = pytesseract.image_to_data(img_ocr, output_type=pytesseract.Output.DICT)
+                n = len(ocr.get('text', []))
+                for i in range(n):
+                    t = (ocr['text'][i] or '').strip()
+                    if len(t) == 1 and t.upper() in list('ABCDEFGH'):
+                        x = ocr['left'][i] + ocr['width'][i] / 2.0
+                        y = ocr['top'][i] + ocr['height'][i] / 2.0
+                        spans.append({'ch': t.upper(), 'x': x / 3.0, 'y': y / 3.0})
+                # if still no spans, we can only report baseline values
+                if not spans:
+                    return info
+            spans.sort(key=lambda a: a['y'])
+            rows = []
+            cur = [spans[0]]
+            for s in spans[1:]:
+                if abs(s['y'] - cur[0]['y']) < 6:
+                    cur.append(s)
+                else:
+                    rows.append(cur)
+                    cur = [s]
+            if cur:
+                rows.append(cur)
+            best = None
+            bestu = -1
+            for r in rows:
+                u = {a['ch'] for a in r}
+                if len(u) >= 6:
+                    xs = [a['x'] for a in r]
+                    if xs and (max(xs) - min(xs)) > 150 and len(u) > bestu:
+                        best = r
+                        bestu = len(u)
+            if not best:
+                return info
+            best.sort(key=lambda a: a['x'])
+            letters = list('ABCDEFGH')
+            centers_map = {a['ch']: a['x'] for a in best}
+            known = [(ch, centers_map[ch]) for ch in letters if ch in centers_map]
+            known.sort(key=lambda a: a[1])
+            min_ch, min_x = known[0]
+            max_ch, max_x = known[-1]
+            idx_min = letters.index(min_ch)
+            idx_max = letters.index(max_ch)
+            span = max(idx_max - idx_min, 1)
+            step = (max_x - min_x) / span
+            centers_pts = []
+            for i, ch in enumerate(letters):
+                if ch in centers_map:
+                    centers_pts.append(centers_map[ch])
+                else:
+                    centers_pts.append(min_x + (i - idx_min) * step)
+            header_y_pt = sum(a['y'] for a in best) / len(best)
+
+            # Render page to grayscale
+            mat = fitz.Matrix(3, 3)
+            pix = page.get_pixmap(matrix=mat)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert('L')
+            scale = 3.0
+            centers_px = [int(x * scale) for x in centers_pts]
+            header_y_px = int(header_y_pt * scale)
+            info['header_y_px'] = header_y_px
+            info['centers_px'] = centers_px
+
+            import numpy as np
+            arr = np.array(img)
+            H, W = arr.shape
+            y0 = min(max(header_y_px + 40, 0), H - 1)
+            band = arr[y0:H, :]
+            dark = 255 - band
+
+            # Build column correlation profiles (reuse row_bands kernels)
+            ksz = 19
+            half = ksz // 2
+            k_pos = np.zeros((ksz, ksz), dtype=np.float32)
+            k_neg = np.zeros((ksz, ksz), dtype=np.float32)
+            for i in range(ksz):
+                j = i
+                for t in (-1, 0, 1):
+                    jj = j + t
+                    if 0 <= jj < ksz:
+                        k_pos[i, jj] = 1.0
+                j2 = ksz - 1 - i
+                for t in (-1, 0, 1):
+                    jj2 = j2 + t
+                    if 0 <= jj2 < ksz:
+                        k_neg[i, jj2] = 1.0
+            k_pos /= k_pos.sum() or 1.0
+            k_neg /= k_neg.sum() or 1.0
+
+            half_w = half
+            col_profiles = []
+            for cx in centers_px:
+                x0c = max(0, cx - half_w)
+                x1c = min(W, cx + half_w + 1)
+                strip = dark[:, x0c:x1c]
+                vlen = strip.shape[0]
+                scores = np.zeros(vlen, dtype=np.float32)
+                for yi in range(vlen):
+                    yb = yi - half
+                    ye = yi + half + 1
+                    if yb < 0 or ye > vlen:
+                        continue
+                    patch = strip[yb:ye, :]
+                    if patch.shape[0] != ksz or patch.shape[1] != ksz:
+                        continue
+                    s = (patch * k_pos).sum() + (patch * k_neg).sum()
+                    scores[yi] = s
+                # Smooth
+                k = np.ones(13, dtype=np.float32)
+                v2 = np.convolve(scores, k, mode='same')
+                col_profiles.append(v2)
+
+            row_energy = np.sum(np.vstack(col_profiles), axis=0)
+            # peaks with separation
+            peaks = []
+            last = -9999
+            min_sep = 45
+            for y in range(1, len(row_energy) - 1):
+                if row_energy[y] > row_energy[y-1] and row_energy[y] >= row_energy[y+1]:
+                    if y - last >= min_sep:
+                        peaks.append((float(row_energy[y]), int(y)))
+                        last = y
+            peaks.sort(key=lambda a: a[0], reverse=True)
+            info['row_energy_peaks'] = peaks[:10]
+
+            chosen = sorted(peaks[:expected_count], key=lambda a: a[1])
+            chosen_rows = [int(y) for (_, y) in chosen]
+            info['chosen_rows_y'] = chosen_rows
+
+            # Darkness box per chosen row
+            box_h = 28
+            box_w = 28
+            per_row = []
+            for y in chosen_rows:
+                yy = y0 + y
+                row_scores = []
+                for cx in centers_px:
+                    x0b = max(0, cx - box_w//2)
+                    x1b = min(W, cx + box_w//2)
+                    y0b = max(0, yy - box_h//2)
+                    y1b = min(H, yy + box_h//2)
+                    crop = arr[y0b:y1b, x0b:x1b]
+                    row_scores.append(int((255 - crop).sum()))
+                per_row.append(row_scores)
+            info['col_darkness_per_row'] = per_row
+
+            # Values via our method
+            vals_rb = []
+            for scores in per_row:
+                if scores:
+                    col_idx = int(np.argmax(scores))
+                    vals_rb.append(col_idx + 1)
+            while len(vals_rb) < expected_count:
+                vals_rb.append(4)
+            info['values_row_bands'] = vals_rb[:expected_count]
+
+            # Baseline text-based
+            info['values_text_based'] = self.extract_checkbox_values_text_based(pdf_doc, page_num, expected_count)
+            return info
+        except Exception:
+            return info
+
     def extract_checkbox_values_auto(self, pdf_doc, page_num, expected_count):
         """
         Wrapper that applies text-based extraction and conditionally applies OCR fallback
@@ -1225,10 +1945,19 @@ class FITREPExtractor:
         tb = self.extract_checkbox_values_text_based(pdf_doc, page_num, expected_count)
         mode = self.checkbox_fallback_mode
         if mode == 'off':
-            return tb
+            result = tb
+            # Final guard: in strict mode, do not return uniform or default-only results
+            if self.strict_no_defaults and isinstance(result, list) and len(result) == expected_count:
+                if len(set(result)) == 1 or result.count(4) == expected_count:
+                    return None
+            return result
         if mode == 'force':
             fb = self.extract_checkbox_values_ocr_fallback(pdf_doc, page_num, expected_count)
-            return fb or tb
+            result = fb or tb
+            if self.strict_no_defaults and isinstance(result, list) and len(result) == expected_count:
+                if len(set(result)) == 1 or result.count(4) == expected_count:
+                    return None
+            return result
 
         # auto: trigger fallback when text-based looks suspicious
         # Heuristics: all defaults 4, or all identical values, or zero X marks were detected
@@ -1239,9 +1968,221 @@ class FITREPExtractor:
             suspicious = True
 
         if suspicious:
+            # Try pure image grid detector first (handles rasterized grids/X's)
+            gi = self.extract_checkbox_values_grid_image(pdf_doc, page_num, expected_count)
+            if gi and gi != [4] * expected_count:
+                return gi
+            # Try vector path detection first for drawn X's
+            vp = self.extract_checkbox_values_vector_paths(pdf_doc, page_num, expected_count)
+            if vp and vp != [4] * expected_count:
+                return vp
+            rb = self.extract_checkbox_values_row_bands(pdf_doc, page_num, expected_count)
+            if rb and rb != [4] * expected_count:
+                return rb
+            ip = self.extract_checkbox_values_image_peaks(pdf_doc, page_num, expected_count)
+            if ip and ip != [4] * expected_count:
+                return ip
             fb = self.extract_checkbox_values_ocr_fallback(pdf_doc, page_num, expected_count)
-            return fb or tb
-        return tb
+            result = fb or tb
+        else:
+            result = tb
+        if self.strict_no_defaults and isinstance(result, list) and len(result) == expected_count:
+            if len(set(result)) == 1 or result.count(4) == expected_count:
+                return None
+        return result
+
+    def extract_checkbox_values_grid_image(self, pdf_doc, page_num, expected_count):
+        """
+        Pure image-based detector for rasterized grids/X's (no text anchors):
+        - Render page to grayscale.
+        - Identify row centers by vertical projection peaks within likely area.
+        - Identify grid left/right by horizontal projection; split into 8 equal columns.
+        - For each row, pick the darkest column band.
+        """
+        try:
+            if page_num >= len(pdf_doc):
+                return [4] * expected_count
+            page = pdf_doc[page_num]
+            # Render grayscale at scale 3
+            mat = fitz.Matrix(3, 3)
+            pix = page.get_pixmap(matrix=mat)
+            img_gray = Image.open(io.BytesIO(pix.tobytes("png"))).convert('L')
+            W, H = img_gray.size
+            px = img_gray.load()
+
+            def mov_avg(vals, k):
+                if k <= 1 or not vals:
+                    return vals[:]
+                n = len(vals)
+                out = [0.0] * n
+                csum = [0.0]
+                for v in vals:
+                    csum.append(csum[-1] + v)
+                half = k // 2
+                for i in range(n):
+                    a = max(0, i - half)
+                    b = min(n, i + half + 1)
+                    out[i] = (csum[b] - csum[a]) / max(1, (b - a))
+                return out
+
+            # Row projection in central band
+            y_top = int(H * 0.20)
+            y_bot = int(H * 0.90)
+            row_proj = []
+            for y in range(y_top, y_bot):
+                s = 0
+                for x in range(W):
+                    s += 255 - px[x, y]
+                row_proj.append(float(s))
+            row_sm = mov_avg(row_proj, 41)
+
+            # Row peaks
+            peaks = []
+            last = -10_000
+            min_sep = max(40, (y_bot - y_top) // (expected_count + 1))
+            for i in range(1, len(row_sm) - 1):
+                if row_sm[i] > row_sm[i - 1] and row_sm[i] >= row_sm[i + 1]:
+                    if i - last >= min_sep:
+                        peaks.append((row_sm[i], i))
+                        last = i
+            if not peaks:
+                return [4] * expected_count
+            peaks.sort(key=lambda a: a[0], reverse=True)
+            chosen = sorted(peaks[:expected_count], key=lambda a: a[1])
+            row_centers = [y_top + int(y) for (_, y) in chosen]
+
+            # Column projection around row bands
+            band_half = 30
+            col_proj = [0.0] * W
+            for yc in row_centers:
+                y0 = max(0, yc - band_half)
+                y1 = min(H, yc + band_half)
+                for x in range(W):
+                    s = 0
+                    for yy in range(y0, y1):
+                        s += 255 - px[x, yy]
+                    col_proj[x] += float(s)
+            col_sm = mov_avg(col_proj, 21)
+            if not col_sm:
+                return [4] * expected_count
+            thr = max(col_sm) * 0.35
+            xs = [i for i, v in enumerate(col_sm) if v >= thr]
+            if len(xs) < 8:
+                thr = max(col_sm) * 0.20
+                xs = [i for i, v in enumerate(col_sm) if v >= thr]
+            if not xs:
+                return [4] * expected_count
+            x_left = int(min(xs))
+            x_right = int(max(xs))
+            pad = max(0, (x_right - x_left) // 40)
+            x_left += pad
+            x_right -= pad
+            if x_right <= x_left + 8:
+                return [4] * expected_count
+
+            # Try to locate 7 internal vertical separators (grid lines) for precise columns
+            # by finding strong local maxima in col_sm within [x_left, x_right]
+            sep_min_gap = max(6, (x_right - x_left) // 16)
+            peaks_x = []
+            for x in range(x_left + 3, x_right - 3):
+                v = col_sm[x]
+                if v > col_sm[x-1] and v >= col_sm[x+1]:
+                    if not peaks_x or x - peaks_x[-1][1] >= sep_min_gap:
+                        peaks_x.append((v, x))
+                    elif v > peaks_x[-1][0]:
+                        peaks_x[-1] = (v, x)
+            # Take top 7 peaks by strength with spacing enforced
+            peaks_x.sort(key=lambda a: a[0], reverse=True)
+            selected = []
+            for v, x in peaks_x:
+                if all(abs(x - sx) >= sep_min_gap for sx in [px for _, px in selected]):
+                    selected.append((v, x))
+                if len(selected) == 7:
+                    break
+            selected = sorted([px for _, px in selected])
+
+            cols = []
+            if len(selected) == 7:
+                bounds = [x_left] + selected + [x_right]
+                for i in range(8):
+                    x0 = int(bounds[i])
+                    x1 = int(bounds[i+1])
+                    cols.append((x0, max(x0 + 1, x1)))
+            else:
+                # Fallback to equal-width columns
+                for i in range(8):
+                    x0 = int(x_left + i * (x_right - x_left) / 8.0)
+                    x1 = int(x_left + (i + 1) * (x_right - x_left) / 8.0)
+                    cols.append((x0, max(x0 + 1, x1)))
+
+            # Score each cell per row
+            values = []
+            box_h = 36
+            row_col_scores = []
+            for yc in row_centers:
+                y0 = max(0, yc - box_h // 2)
+                y1 = min(H, yc + box_h // 2)
+                scores = []
+                for (x0, x1) in cols:
+                    width = x1 - x0
+                    inner_w = max(6, int(width * 0.4))
+                    cx = (x0 + x1) // 2
+                    ix0 = max(0, cx - inner_w // 2)
+                    ix1 = min(W, cx + inner_w // 2)
+                    # Darkness
+                    s_dark = 0.0
+                    for yy in range(y0, y1):
+                        for xx in range(ix0, ix1):
+                            s_dark += 255 - px[xx, yy]
+                    # Diagonals
+                    diag = 0.0
+                    w = ix1 - ix0
+                    h = y1 - y0
+                    for d in range(-2, 3):
+                        for k in range(h):
+                            x = k + d
+                            if 0 <= x < w:
+                                diag += 255 - px[ix0 + x, y0 + k]
+                            x2 = (w - 1 - k) + d
+                            if 0 <= x2 < w:
+                                diag += 255 - px[ix0 + x2, y0 + k]
+                    # OCR hint
+                    try:
+                        cell_img = img_gray.crop((ix0, y0, ix1, y1))
+                        ocr_txt = pytesseract.image_to_string(cell_img, config='--psm 10 -c tessedit_char_whitelist=Xx')
+                        has_x = 'x' in (ocr_txt or '').lower()
+                    except Exception:
+                        has_x = False
+                    score = 0.25 * s_dark + 1.0 * diag + (50000.0 if has_x else 0.0)
+                    scores.append(score)
+                row_col_scores.append(scores)
+
+            # Normalize by per-column baseline (median across rows) to suppress persistent gridline darkness
+            if row_col_scores:
+                import statistics
+                col_count = len(row_col_scores[0])
+                baselines = []
+                for ci in range(col_count):
+                    col_vals = [row[ci] for row in row_col_scores]
+                    try:
+                        b = statistics.median(col_vals)
+                    except statistics.StatisticsError:
+                        b = sum(col_vals)/max(1,len(col_vals))
+                    baselines.append(b)
+                values = []
+                beta = 0.9
+                for scores in row_col_scores:
+                    adj = [scores[i] - beta * baselines[i] for i in range(len(scores))]
+                    best_idx = max(range(len(adj)), key=lambda i: adj[i])
+                    values.append(best_idx + 1)
+            else:
+                values = [4] * expected_count
+
+            if len(values) < expected_count:
+                values += [4] * (expected_count - len(values))
+            return values
+        except Exception:
+            return [4] * expected_count
 
     def extract_marine_last_name_by_edipi(self, pdf_doc, marine_edipi):
         """Extract Marine's last name by locating the Marine EDIPI on page 1 and walking upwards.

@@ -14,7 +14,10 @@ def extract_ah_values(path: Path, mode: str):
     data = ex.extract_from_pdf(path)
     if not data:
         return []
-    return data.get('page2_values', []) + data.get('page3_values', []) + data.get('page4_values', [])
+    v2 = data.get('page2_values') or []
+    v3 = data.get('page3_values') or []
+    v4 = data.get('page4_values') or []
+    return v2 + v3 + v4
 
 
 def main():
