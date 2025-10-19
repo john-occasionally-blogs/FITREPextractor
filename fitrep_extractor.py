@@ -2025,12 +2025,8 @@ class FITREPExtractor:
         tb = self.extract_checkbox_values_text_based(pdf_doc, page_num, expected_count)
         mode = self.checkbox_fallback_mode
         if mode == 'off':
-            result = tb
-            if self.strict_no_defaults and isinstance(result, list) and len(result) == expected_count:
-                # Only reject default-all-4s; allow uniform non-4 (valid all-same scores)
-                if result.count(4) == expected_count:
-                    return None
-            return result
+            # Fast path: return text-based as-is (allow all-4s when no X marks are present)
+            return tb
         if mode == 'force':
             fb = self.extract_checkbox_values_ocr_fallback(pdf_doc, page_num, expected_count)
             result = fb or tb
@@ -2096,7 +2092,7 @@ class FITREPExtractor:
                     if len(non1) >= 2 and non1[0] == non1[1]:
                         merged[i] = non1[0]
             result = merged
-        if self.strict_no_defaults and isinstance(result, list) and len(result) == expected_count:
+        if mode != 'off' and self.strict_no_defaults and isinstance(result, list) and len(result) == expected_count:
             if result.count(4) == expected_count:
                 return None
         return result

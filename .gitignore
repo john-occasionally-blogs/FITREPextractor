@@ -7,3 +7,6 @@ fitrep_extract_*.csv
 Cleanup/*.csv
 Cleanup/pdf_structure.json
 *.pdf
+__pycache__/
+*.pyc
+examples/
